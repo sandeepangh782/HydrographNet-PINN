@@ -9,8 +9,8 @@ hydra:
     dir: ./outputs_phy/  # Directory to save outputs.
 
 # Data configuration: paths for training and testing datasets.
-data_dir: ./data
-test_dir: ./data/Test
+data_dir: /Users/sandeepanghosh/Downloads/HydroGraphNet
+test_dir: /Users/sandeepanghosh/Downloads/HydroGraphNet/Test
 
 # Training configuration.
 batch_size: 1
@@ -34,17 +34,17 @@ delta_t: 1200.0
 physics_loss_weight: 1.0
 
 # Performance and optimization configurations.
-use_apex: True            # Use NVIDIA Apex for mixed precision if available.
+use_apex: False           # Disable NVIDIA Apex (not available on Mac)
 amp: False                # Automatic mixed precision flag.
 jit: False                # Use TorchScript JIT compilation.
-num_dataloader_workers: 4
+num_dataloader_workers: 0 # Set to 0 for Mac (avoids multiprocessing issues)
 do_concat_trick: False
 num_processor_checkpoint_segments: 0
 recompute_activation: False
 
 # WandB logging configuration.
-wandb_mode: disabled
-watch_model: False
+wandb_mode: online
+watch_model: true
 
 # Checkpoint path.
 ckpt_path: "./checkpoints_phy"
@@ -52,3 +52,6 @@ ckpt_path: "./checkpoints_phy"
 # Test and visualization configuration.
 num_test_samples: 10
 num_test_time_steps: 30
+
+# Logging configuration
+log_batch_frequency: 10         # Log every N batches (avoid overwhelming WandB)

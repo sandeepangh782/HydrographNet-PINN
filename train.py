@@ -24,6 +24,55 @@ from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from utils import compute_physics_loss
 
 
+class MetricsTracker:
+    """Aggregates metrics across batches for epoch-level reporting"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.losses = []
+        self.predictions = []
+        self.targets = []
+        self.batch_times = []
+
+    def update(self, loss_value, pred, target, batch_time):
+        self.losses.append(loss_value)
+        self.predictions.append(pred.detach().cpu())
+        self.targets.append(target.detach().cpu())
+        self.batch_times.append(batch_time)
+
+    def compute_epoch_metrics(self):
+        """Compute aggregated metrics for the epoch"""
+        all_preds = torch.cat(self.predictions, dim=0)
+        all_targets = torch.cat(self.targets, dim=0)
+
+        # RMSE per output dimension (depth, volume)
+        rmse_depth = torch.sqrt(torch.mean((all_preds[:, 0] - all_targets[:, 0])**2)).item()
+        rmse_volume = torch.sqrt(torch.mean((all_preds[:, 1] - all_targets[:, 1])**2)).item()
+
+        # MAE per output dimension
+        mae_depth = torch.mean(torch.abs(all_preds[:, 0] - all_targets[:, 0])).item()
+        mae_volume = torch.mean(torch.abs(all_preds[:, 1] - all_targets[:, 1])).item()
+
+        # R² score for depth
+        target_depth = all_targets[:, 0]
+        pred_depth = all_preds[:, 0]
+        ss_res = torch.sum((target_depth - pred_depth)**2)
+        ss_tot = torch.sum((target_depth - target_depth.mean())**2)
+        r2_depth = (1 - ss_res / (ss_tot + 1e-8)).item()
+
+        return {
+            "avg_loss": sum(self.losses) / len(self.losses),
+            "rmse_depth": rmse_depth,
+            "rmse_volume": rmse_volume,
+            "mae_depth": mae_depth,
+            "mae_volume": mae_volume,
+            "r2_depth": r2_depth,
+            "avg_batch_time": sum(self.batch_times) / len(self.batch_times),
+        }
+
+
 # Custom collate function that checks if each item is a tuple (graph, physics_data) or a plain graph.
 def collate_fn(batch):
     if isinstance(batch[0], tuple):
@@ -162,6 +211,24 @@ class MGNTrainer:
             f"Checkpoint loaded. Starting training from epoch {self.epoch_init}."
         )
 
+        # Initialize metrics tracker
+        self.metrics_tracker = MetricsTracker()
+
+        # Log model size
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        rank_zero_logger.info(f"Total parameters: {total_params:,}")
+        rank_zero_logger.info(f"Trainable parameters: {trainable_params:,}")
+
+    def compute_gradient_norm(self):
+        """Compute total gradient norm across all parameters"""
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
     def train(self, batch):
         if self.use_physics_loss:
             graph, physics_data = batch
@@ -228,6 +295,8 @@ class MGNTrainer:
                     "total_loss": loss,
                     "loss_one": one_step_loss,
                     "loss_stability": stability_loss,
+                    "loss_depth": self.criterion(pred_one[:, 0], graph.y[:, 0]),
+                    "loss_volume": self.criterion(pred_one[:, 1], graph.y[:, 1]),
                 }
                 if self.use_physics_loss and physics_data is not None:
                     phy_loss = compute_physics_loss(
@@ -241,7 +310,19 @@ class MGNTrainer:
                 pred = self.model(graph.x, graph.edge_attr, graph)
                 mse_loss = self.criterion(pred, graph.y)
                 loss = mse_loss
-                loss_dict = {"total_loss": loss, "mse_loss": mse_loss}
+
+                # Per-component losses
+                pred_depth = pred[:, 0]
+                pred_volume = pred[:, 1]
+                target_depth = graph.y[:, 0]
+                target_volume = graph.y[:, 1]
+
+                loss_dict = {
+                    "total_loss": loss,
+                    "mse_loss": mse_loss,
+                    "loss_depth": self.criterion(pred_depth, target_depth),
+                    "loss_volume": self.criterion(pred_volume, target_volume),
+                }
                 if self.use_physics_loss and physics_data is not None:
                     phy_loss = compute_physics_loss(
                         pred, physics_data, graph, delta_t=self.delta_t
@@ -265,10 +346,10 @@ def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
     dist = DistributedManager()
     initialize_wandb(
-        project="Modulus-Launch",
-        entity="Modulus",
-        name="Vortex_Shedding-Training",
-        group="Vortex_Shedding-DDP-Group",
+        project="HydroGraphNet",
+        entity="sandeepangh-srm-institute-of-science-and-technology",
+        name=f"training-run-{cfg.epochs}epochs",
+        group="flood-forecasting",
         mode=cfg.wandb_mode,
     )
     logger = PythonLogger("main")
@@ -280,30 +361,92 @@ def main(cfg: DictConfig) -> None:
     start_time = time.time()
 
     for epoch in range(trainer.epoch_init, cfg.epochs):
-        epoch_loss = 0.0
-        num_batches = 0
-        for batch in trainer.dataloader:
+        epoch_start_time = time.time()
+        trainer.metrics_tracker.reset()
+
+        for batch_idx, batch in enumerate(trainer.dataloader):
+            batch_start_time = time.time()
+
+            # Training step
             loss, loss_dict = trainer.train(batch)
-            epoch_loss += loss.detach().item()
-            num_batches += 1
 
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else float("inf")
-        rank_zero_logger.info(f"Epoch {epoch} completed. Average Loss: {avg_loss:.4e}")
+            # Extract predictions and targets
+            if trainer.use_physics_loss:
+                graph, _ = batch
+            else:
+                graph = batch
+            graph = graph.to(trainer.dist.device)
 
-        wandb.log(
-            {
-                "total_loss": loss_dict["total_loss"].detach().cpu(),
-                "loss_one": loss_dict.get("loss_one", torch.tensor(0.0)).detach().cpu(),
-                "loss_stability": loss_dict.get("loss_stability", torch.tensor(0.0))
-                .detach()
-                .cpu(),
-                "physics_loss": loss_dict.get("physics_loss", torch.tensor(0.0))
-                .detach()
-                .cpu(),
-                "epoch": epoch,
-            }
+            # Get predictions (re-forward for tracking - could optimize)
+            with torch.no_grad():
+                pred = trainer.model(graph.x, graph.edge_attr, graph)
+
+            batch_time = time.time() - batch_start_time
+            trainer.metrics_tracker.update(
+                loss.detach().item(), pred, graph.y, batch_time
+            )
+
+            # Optional: Log per-batch metrics (every 10 batches)
+            if batch_idx % cfg.get("log_batch_frequency", 10) == 0:
+                wandb.log({
+                    "batch/loss": loss.detach().item(),
+                    "batch/step": epoch * len(trainer.dataloader) + batch_idx,
+                })
+
+        # Compute epoch metrics
+        epoch_metrics = trainer.metrics_tracker.compute_epoch_metrics()
+        grad_norm = trainer.compute_gradient_norm()
+        current_lr = trainer.scheduler.get_last_lr()[0]
+
+        # GPU memory stats
+        if torch.cuda.is_available():
+            gpu_mem_allocated_gb = torch.cuda.memory_allocated() / 1e9
+            gpu_mem_reserved_gb = torch.cuda.memory_reserved() / 1e9
+        else:
+            gpu_mem_allocated_gb = gpu_mem_reserved_gb = 0.0
+
+        # Epoch duration
+        epoch_time = time.time() - epoch_start_time
+        samples_per_sec = len(trainer.dataloader) / epoch_time
+
+        # Comprehensive WandB logging
+        wandb.log({
+            # Loss components
+            "loss/total": epoch_metrics["avg_loss"],
+            "loss/depth": loss_dict.get("loss_depth", torch.tensor(0.0)).detach().cpu().item(),
+            "loss/volume": loss_dict.get("loss_volume", torch.tensor(0.0)).detach().cpu().item(),
+            "loss/physics": loss_dict.get("physics_loss", torch.tensor(0.0)).detach().cpu().item(),
+
+            # Prediction quality metrics
+            "metrics/rmse_depth": epoch_metrics["rmse_depth"],
+            "metrics/rmse_volume": epoch_metrics["rmse_volume"],
+            "metrics/mae_depth": epoch_metrics["mae_depth"],
+            "metrics/mae_volume": epoch_metrics["mae_volume"],
+            "metrics/r2_depth": epoch_metrics["r2_depth"],
+
+            # Training dynamics
+            "training/learning_rate": current_lr,
+            "training/grad_norm": grad_norm,
+            "training/epoch_time_sec": epoch_time,
+            "training/batch_time_avg_sec": epoch_metrics["avg_batch_time"],
+            "training/samples_per_second": samples_per_sec,
+
+            # System performance
+            "system/gpu_memory_allocated_gb": gpu_mem_allocated_gb,
+            "system/gpu_memory_reserved_gb": gpu_mem_reserved_gb,
+
+            "epoch": epoch,
+        })
+
+        # Enhanced console logging
+        rank_zero_logger.info(
+            f"Epoch {epoch} | Loss: {epoch_metrics['avg_loss']:.4e} | "
+            f"RMSE (depth/vol): {epoch_metrics['rmse_depth']:.4f}/{epoch_metrics['rmse_volume']:.4f} | "
+            f"R²: {epoch_metrics['r2_depth']:.3f} | "
+            f"LR: {current_lr:.2e} | Time: {epoch_time:.1f}s"
         )
 
+        # Checkpoint saving (keep existing logic)
         if dist.world_size > 1:
             torch.distributed.barrier()
         if dist.rank == 0:
@@ -318,8 +461,7 @@ def main(cfg: DictConfig) -> None:
             rank_zero_logger.info(f"Checkpoint saved at epoch {epoch}.")
 
         elapsed = time.time() - start_time
-        rank_zero_logger.info(f"Epoch {epoch} duration: {elapsed:.2f} seconds.")
-        start_time = time.time()
+        rank_zero_logger.info(f"Total training time: {elapsed:.2f} seconds.")
 
     rank_zero_logger.info("Training completed successfully.")
 
