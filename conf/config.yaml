@@ -10,7 +10,7 @@ hydra:
 
 # Data configuration: paths for training and testing datasets.
 data_dir: /Users/sandeepanghosh/Downloads/HydroGraphNet
-test_dir: /Users/sandeepanghosh/Downloads/HydroGraphNet/Test
+test_dir: /Users/sandeepanghosh/Downloads/HydroGraphNet
 
 # Training configuration.
 batch_size: 1
@@ -31,7 +31,14 @@ n_time_steps: 2           # Number of time steps in the sliding window.
 # Physics loss settings.
 use_physics_loss: true
 delta_t: 1200.0
-physics_loss_weight: 1.0
+physics_loss_weight: 1.0      # used when physics_loss_schedule: fixed
+
+# Adaptive physics loss scheduling.
+# strategy options: "fixed" | "linear_warmup" | "gnb" | "plateau"
+physics_loss_schedule: "fixed"
+physics_lambda_init: 0.01     # starting λ for warmup / gnb strategies
+physics_lambda_max: 1.0       # ceiling λ (all strategies)
+physics_warmup_epochs: 20     # epochs to ramp from λ_init → λ_max (linear_warmup only)
 
 # Performance and optimization configurations.
 use_apex: False           # Disable NVIDIA Apex (not available on Mac)

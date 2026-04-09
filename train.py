@@ -22,6 +22,7 @@ from physicsnemo.utils.logging.wandb import initialize_wandb
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from utils import compute_physics_loss
+from adaptive_physics_scheduler import build_scheduler
 
 
 class MetricsTracker:
@@ -35,12 +36,24 @@ class MetricsTracker:
         self.predictions = []
         self.targets = []
         self.batch_times = []
+        # Per-loss gradient norms for adaptive scheduling
+        self.grad_norms_mse = []
+        self.grad_norms_phy = []
 
-    def update(self, loss_value, pred, target, batch_time):
+    def update(self, loss_value, pred, target, batch_time,
+               g_mse: float = 0.0, g_phy: float = 0.0):
         self.losses.append(loss_value)
         self.predictions.append(pred.detach().cpu())
         self.targets.append(target.detach().cpu())
         self.batch_times.append(batch_time)
+        self.grad_norms_mse.append(g_mse)
+        self.grad_norms_phy.append(g_phy)
+
+    def epoch_grad_norms(self):
+        """Return mean per-loss gradient norms across all batches this epoch."""
+        g_mse = sum(self.grad_norms_mse) / max(len(self.grad_norms_mse), 1)
+        g_phy = sum(self.grad_norms_phy) / max(len(self.grad_norms_phy), 1)
+        return g_mse, g_phy
 
     def compute_epoch_metrics(self):
         """Compute aggregated metrics for the epoch"""
@@ -101,6 +114,17 @@ class MGNTrainer:
         self.use_physics_loss = cfg.get("use_physics_loss", False)
         self.delta_t = cfg.get("delta_t", 1200.0)
         self.physics_loss_weight = cfg.get("physics_loss_weight", 1.0)
+
+        # Adaptive physics loss scheduler.
+        sched_strategy = cfg.get("physics_loss_schedule", "fixed")
+        self.physics_scheduler = build_scheduler(
+            sched_strategy,
+            lambda_init=cfg.get("physics_lambda_init", self.physics_loss_weight),
+            lambda_max=cfg.get("physics_lambda_max", self.physics_loss_weight),
+            T_warmup=cfg.get("physics_warmup_epochs", 20),
+            lambda_phy=self.physics_loss_weight,   # used by "fixed" strategy
+        )
+        self.physics_loss_weight = self.physics_scheduler.lambda_phy
 
         # Set activation function.
         mlp_act = "relu"
@@ -221,13 +245,51 @@ class MGNTrainer:
         rank_zero_logger.info(f"Trainable parameters: {trainable_params:,}")
 
     def compute_gradient_norm(self):
-        """Compute total gradient norm across all parameters"""
+        """Compute total gradient norm across all parameters."""
         total_norm = 0.0
         for p in self.model.parameters():
             if p.grad is not None:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
+
+    def compute_per_loss_grad_norms(self, graph, physics_data):
+        """
+        Compute gradient norms for MSE loss and physics loss separately.
+
+        Performs two isolated backward passes (no optimizer step) to obtain
+        ||∇_θ L_MSE|| and ||∇_θ L_physics||, then restores the model state.
+        Used by the GradientNormBalancer scheduler.
+
+        Returns:
+            (g_mse, g_phy) : float gradient norms
+        """
+        def _grad_norm_for(loss_tensor):
+            self.optimizer.zero_grad()
+            loss_tensor.backward(retain_graph=True)
+            norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    norm += p.grad.data.norm(2).item() ** 2
+            return norm ** 0.5
+
+        self.model.zero_grad()
+
+        # --- MSE gradient norm ---
+        pred_for_mse = self.model(graph.x, graph.edge_attr, graph)
+        g_mse = _grad_norm_for(self.criterion(pred_for_mse, graph.y))
+
+        # --- Physics gradient norm (only if physics loss is active) ---
+        g_phy = 0.0
+        if self.use_physics_loss and physics_data is not None:
+            pred_for_phy = self.model(graph.x, graph.edge_attr, graph)
+            phy_loss = compute_physics_loss(
+                pred_for_phy, physics_data, graph, delta_t=self.delta_t
+            )
+            g_phy = _grad_norm_for(phy_loss)
+
+        self.optimizer.zero_grad()
+        return g_mse, g_phy
 
     def train(self, batch):
         if self.use_physics_loss:
@@ -398,6 +460,16 @@ def main(cfg: DictConfig) -> None:
         grad_norm = trainer.compute_gradient_norm()
         current_lr = trainer.scheduler.get_last_lr()[0]
 
+        # --- Adaptive physics loss scheduler step ---
+        g_mse_epoch, g_phy_epoch = trainer.metrics_tracker.epoch_grad_norms()
+        new_lambda = trainer.physics_scheduler.step(
+            g_mse=g_mse_epoch,
+            g_phy=g_phy_epoch,
+            val_loss=epoch_metrics["avg_loss"],
+        )
+        trainer.physics_loss_weight = new_lambda
+        rho = (g_phy_epoch / (g_mse_epoch + 1e-8)) if g_mse_epoch > 0 else 0.0
+
         # GPU memory stats
         if torch.cuda.is_available():
             gpu_mem_allocated_gb = torch.cuda.memory_allocated() / 1e9
@@ -431,6 +503,12 @@ def main(cfg: DictConfig) -> None:
             "training/batch_time_avg_sec": epoch_metrics["avg_batch_time"],
             "training/samples_per_second": samples_per_sec,
 
+            # Adaptive physics scheduling diagnostics
+            "physics/lambda_phy": new_lambda,
+            "physics/grad_norm_mse": g_mse_epoch,
+            "physics/grad_norm_phy": g_phy_epoch,
+            "physics/grad_norm_ratio_rho": rho,
+
             # System performance
             "system/gpu_memory_allocated_gb": gpu_mem_allocated_gb,
             "system/gpu_memory_reserved_gb": gpu_mem_reserved_gb,
@@ -443,6 +521,7 @@ def main(cfg: DictConfig) -> None:
             f"Epoch {epoch} | Loss: {epoch_metrics['avg_loss']:.4e} | "
             f"RMSE (depth/vol): {epoch_metrics['rmse_depth']:.4f}/{epoch_metrics['rmse_volume']:.4f} | "
             f"R²: {epoch_metrics['r2_depth']:.3f} | "
+            f"λ_phy: {new_lambda:.4f} | ρ: {rho:.3f} | "
             f"LR: {current_lr:.2e} | Time: {epoch_time:.1f}s"
         )
 

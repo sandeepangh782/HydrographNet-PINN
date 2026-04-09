@@ -28,7 +28,7 @@ from physicsnemo.utils import load_checkpoint
 
 # Import the dataset and model.
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
-from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
+from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGrahKAN
 
 # For converting PyG graph to networkx.
 from torch_geometric.utils import to_networkx
@@ -227,7 +227,6 @@ def main(cfg: DictConfig):
         edge_features = g.edge_attr.to(device)
         X_current = g.x.to(device)  # Expected shape: [num_nodes, 16]
         num_nodes = X_current.size(0)
-
         rollout_preds = []  # To store predicted actual water depth values for each step.
         ground_truth_list = []  # To store ground truth water depth values.
         rmse_list = []  # RMSE at each rollout step.
